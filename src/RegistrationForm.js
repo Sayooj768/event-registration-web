@@ -21,52 +21,51 @@ function RegistrationForm() {
     const [phone, setPhone] = useState('');
     const [role, setRole] = useState('');
 
-    useEffect(() => {
-        // Fetch all necessary data when the component loads
-        const fetchEventData = async () => {
-            if (!id) return;
-            try {
-                // New Strategy: Fetch from 'registration_settings' first to robustly get settings
-                const { data, error: settingsError } = await supabase
-                    .from('registration_settings')
-                    .select('*, events(*)') // Select all settings and join the parent event
-                    .eq('event_id', id)     // Find the settings for our specific event_id
+    // In src/RegistrationForm.js
+
+useEffect(() => {
+    const fetchEventData = async () => {
+        if (!id) return;
+        try {
+            // We will now fetch the data in two steps for clarity
+
+            // 1. Fetch the event and its settings
+            const { data: eventAndSettingsData, error: settingsError } = await supabase
+                .from('registration_settings')
+                .select('*, events(*)')
+                .eq('event_id', id)
+                .single();
+
+            if (settingsError) {
+                const { data: eventOnlyData, error: eventError } = await supabase
+                    .from('events')
+                    .select('*')
+                    .eq('id', id)
                     .single();
-
-                if (settingsError) {
-                    // If no settings are found, it's not a fatal error.
-                    // Fetch just the event data so we can display it.
-                    const { data: eventOnlyData, error: eventError } = await supabase
-                        .from('events')
-                        .select('*')
-                        .eq('id', id)
-                        .single();
-                    if (eventError) throw eventError;
-                    setEventData(eventOnlyData); // Set event data
-                    setSettingsData(null); // Explicitly set settings to null
-                } else {
-                    setSettingsData(data); // Set the settings data
-                    setEventData(data.events); // Set the nested event data
-                }
-
-                // Fetch participant count separately
-                const { count, error: countError } = await supabase
-                    .from('participants')
-                    .select('*', { count: 'exact', head: true })
-                    .eq('event_id', id);
-
-                if (countError) throw countError;
-                setParticipantCount(count);
-
-            } catch (error) {
-                setError('Sorry, this event could not be found or there was an error.');
-            } finally {
-                setLoading(false);
+                if (eventError) throw eventError;
+                setEventData(eventOnlyData);
+                setSettingsData(null);
+            } else {
+                setSettingsData(eventAndSettingsData);
+                setEventData(eventAndSettingsData.events);
             }
-        };
 
-        fetchEventData();
-    }, [id]);
+            // 2. Call our new database function to get the participant count securely
+            const { data: count, error: countError } = await supabase
+                .rpc('get_participant_count', { p_event_id: id });
+
+            if (countError) throw countError;
+            setParticipantCount(count);
+
+        } catch (error) {
+            setError('Sorry, this event could not be found or there was an error.');
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    fetchEventData();
+}, [id]);
 
     // This function is called AFTER a successful payment or for free events
     // AFTER
