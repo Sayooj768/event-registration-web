@@ -31,14 +31,14 @@ useEffect(() => {
 
             // 1. Fetch the event and its settings
             const { data: eventAndSettingsData, error: settingsError } = await supabase
-                .from('registration_settings')
-                .select('*, events(*)')
+                .from('public_registration_settings')
+                .select('*, public_events(*)')
                 .eq('event_id', id)
                 .single();
 
             if (settingsError) {
                 const { data: eventOnlyData, error: eventError } = await supabase
-                    .from('events')
+                    .from('public_events')
                     .select('*')
                     .eq('id', id)
                     .single();
@@ -47,7 +47,7 @@ useEffect(() => {
                 setSettingsData(null);
             } else {
                 setSettingsData(eventAndSettingsData);
-                setEventData(eventAndSettingsData.events);
+                setEventData(eventAndSettingsData.public_events);
             }
 
             // 2. Call our new database function to get the participant count securely
