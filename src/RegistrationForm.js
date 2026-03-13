@@ -3,100 +3,142 @@ import { useParams } from 'react-router-dom';
 import { supabase } from './supabaseClient';
 import './App.css';
 
+// ── Config ────────────────────────────────────────────────────────────────────
+// Put these in your .env file as REACT_APP_SUPABASE_FUNCTION_URL
+const SUPABASE_FUNCTION_BASE = process.env.REACT_APP_SUPABASE_FUNCTION_BASE
+  ?? 'https://qzfjcmtkojpdbctgggen.supabase.co/functions/v1';
+
 function RegistrationForm() {
-    // Get the event ID from the URL, e.g., /event/123
     const { id } = useParams();
 
-    // State for data loading, errors, and UI control
-    const [loading, setLoading] = useState(true);
-    const [error, setError] = useState(null);
-    const [eventData, setEventData] = useState(null);
-    const [settingsData, setSettingsData] = useState(null);
+    const [loading, setLoading]               = useState(true);
+    const [error, setError]                   = useState(null);
+    const [eventData, setEventData]           = useState(null);
+    const [settingsData, setSettingsData]     = useState(null);
     const [participantCount, setParticipantCount] = useState(0);
-    const [isFormSubmitted, setIsFormSubmitted] = useState(false);
+    const [isFormSubmitted, setIsFormSubmitted]   = useState(false);
 
-    // State for the form's input fields
     const [fullName, setFullName] = useState('');
-    const [email, setEmail] = useState('');
-    const [phone, setPhone] = useState('');
-    const [role, setRole] = useState('');
+    const [email, setEmail]       = useState('');
+    const [phone, setPhone]       = useState('');
+    const [role, setRole]         = useState('');
 
-    // In src/RegistrationForm.js
+    useEffect(() => {
+        const fetchEventData = async () => {
+            if (!id) return;
+            try {
+                const { data: eventAndSettingsData, error: settingsError } = await supabase
+                    .from('public_registration_settings')
+                    .select('*, public_events(*)')
+                    .eq('event_id', id)
+                    .single();
 
-useEffect(() => {
-    const fetchEventData = async () => {
-        if (!id) return;
+                if (settingsError) {
+                    const { data: eventOnlyData, error: eventError } = await supabase
+                        .from('public_events')
+                        .select('*')
+                        .eq('id', id)
+                        .single();
+                    if (eventError) throw eventError;
+                    setEventData(eventOnlyData);
+                    setSettingsData(null);
+                } else {
+                    setSettingsData(eventAndSettingsData);
+                    setEventData(eventAndSettingsData.public_events);
+                }
+
+                const { data: count, error: countError } = await supabase
+                    .rpc('get_participant_count', { p_event_id: id });
+                if (countError) throw countError;
+                setParticipantCount(count);
+
+            } catch (err) {
+                setError('Sorry, this event could not be found or there was an error.');
+            } finally {
+                setLoading(false);
+            }
+        };
+        fetchEventData();
+    }, [id]);
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // saveParticipant → then triggerPayout
+    // ─────────────────────────────────────────────────────────────────────────
+    const saveParticipant = async (paymentDetails = {}) => {
         try {
-            // We will now fetch the data in two steps for clarity
+            const feeAmount = settingsData?.registration_fee || 0;
 
-            // 1. Fetch the event and its settings
-            const { data: eventAndSettingsData, error: settingsError } = await supabase
-                .from('public_registration_settings')
-                .select('*, public_events(*)')
-                .eq('event_id', id)
+            // 1. Insert participant row
+            const { data: participant, error: insertErr } = await supabase
+                .from('participants')
+                .insert({
+                    event_id:       id,
+                    full_name:      fullName,
+                    email:          email,
+                    phone:          phone || null,
+                    role:           role  || null,
+                    payment_id:     paymentDetails.razorpay_payment_id   || null,
+                    order_id:       paymentDetails.razorpay_order_id     || null,
+                    payment_status: feeAmount > 0 ? 'paid' : 'free',
+                    amount_paid:    feeAmount,
+                })
+                .select('id')   // ← need the new participant ID for the payout call
                 .single();
 
-            if (settingsError) {
-                const { data: eventOnlyData, error: eventError } = await supabase
-                    .from('public_events')
-                    .select('*')
-                    .eq('id', id)
-                    .single();
-                if (eventError) throw eventError;
-                setEventData(eventOnlyData);
-                setSettingsData(null);
-            } else {
-                setSettingsData(eventAndSettingsData);
-                setEventData(eventAndSettingsData.public_events);
+            if (insertErr) throw insertErr;
+
+            // 2. Trigger payout — only for paid registrations
+            //    We do NOT await or block the UI on this; fire-and-forget.
+            //    If payout fails, the participant is still registered.
+            if (feeAmount > 0 && paymentDetails.razorpay_payment_id) {
+                triggerPayout({
+                    event_id:       id,
+                    participant_id: participant.id,
+                    amount_paise:   feeAmount,   // already in paise from DB
+                });
             }
 
-            // 2. Call our new database function to get the participant count securely
-            const { data: count, error: countError } = await supabase
-                .rpc('get_participant_count', { p_event_id: id });
+            setIsFormSubmitted(true);
 
-            if (countError) throw countError;
-            setParticipantCount(count);
-
-        } catch (error) {
-            setError('Sorry, this event could not be found or there was an error.');
-        } finally {
-            setLoading(false);
+        } catch (err) {
+            setError(
+                'Payment might have succeeded, but we could not save your registration. ' +
+                'Please contact support.'
+            );
         }
     };
 
-    fetchEventData();
-}, [id]);
+    // ─────────────────────────────────────────────────────────────────────────
+    // triggerPayout — calls our new edge function
+    // Runs in the background; never blocks the registration success screen.
+    // ─────────────────────────────────────────────────────────────────────────
+    const triggerPayout = async ({ event_id, participant_id, amount_paise }) => {
+        try {
+            const res = await fetch(
+                `${SUPABASE_FUNCTION_BASE}/process-payout`,
+                {
+                    method:  'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body:    JSON.stringify({ event_id, participant_id, amount_paise }),
+                }
+            );
+            const data = await res.json();
 
-    // This function is called AFTER a successful payment or for free events
-    // AFTER
-const saveParticipant = async (paymentDetails = {}) => {
-    try {
-        // Get the fee from the event settings to store the amount paid
-        const feeAmount = settingsData?.registration_fee || 0;
+            if (!res.ok) {
+                // Log but do NOT show to participant — this is a backend concern
+                console.error('[Payout] Failed:', data);
+            } else {
+                console.log('[Payout] Triggered:', data);
+            }
+        } catch (err) {
+            // Network error — log silently
+            console.error('[Payout] Network error:', err);
+        }
+    };
 
-        const { error } = await supabase
-            .from('participants')
-            .insert({
-                // Existing fields
-                event_id: id,
-                full_name: fullName,
-                email: email,
-                phone: phone || null,
-                role: role || null,
-
-                // NEW: Add the payment details
-                payment_id: paymentDetails.razorpay_payment_id,
-                order_id: paymentDetails.razorpay_order_id,
-                payment_status: 'paid', // Set the status to 'paid'
-                amount_paid: feeAmount, // Store the amount that was paid
-            });
-        if (error) throw error;
-        setIsFormSubmitted(true);
-    } catch (error) {
-        setError('Payment might have succeeded, but we could not save your registration. Please contact support.');
-    }
-};
-    // This function starts the payment process when the form is submitted
+    // ─────────────────────────────────────────────────────────────────────────
+    // Initiate payment (unchanged from your original)
+    // ─────────────────────────────────────────────────────────────────────────
     const initiatePayment = async (e) => {
         e.preventDefault();
         setLoading(true);
@@ -104,7 +146,6 @@ const saveParticipant = async (paymentDetails = {}) => {
 
         const registrationFee = settingsData?.registration_fee;
 
-        // If the event is free, just save the participant directly
         if (!registrationFee || registrationFee === 0) {
             await saveParticipant();
             setLoading(false);
@@ -112,90 +153,83 @@ const saveParticipant = async (paymentDetails = {}) => {
         }
 
         try {
-            // 1. Call your Supabase Edge Function to create a Razorpay order
             const orderResponse = await fetch(
-                'https://qzfjcmtkojpdbctgggen.supabase.co/functions/v1/create-razorpay-order', // <-- IMPORTANT: Replace
+                `${SUPABASE_FUNCTION_BASE}/create-razorpay-order`,
                 {
-                    method: 'POST',
+                    method:  'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ amount: registrationFee }),
+                    body:    JSON.stringify({ amount: registrationFee }),
                 }
             );
-            
+
             if (!orderResponse.ok) {
                 const errorBody = await orderResponse.json();
                 throw new Error(errorBody.error || 'Could not create payment order.');
             }
             const orderData = await orderResponse.json();
 
-            // 2. Open Razorpay Checkout with the order_id from the function
             const options = {
-                key: 'rzp_test_RKAMFR3BJ3GzR1', // <-- IMPORTANT: Replace
-                amount: orderData.amount,
-                currency: orderData.currency,
-                name: eventData.event_title,
+                key:         process.env.REACT_APP_RAZORPAY_KEY_ID,
+                amount:      orderData.amount,
+                currency:    orderData.currency,
+                name:        eventData.event_title,
                 description: 'Event Registration Fee',
-                order_id: orderData.id,
-                handler: function (response) {
-                    // This function is called by Razorpay after a successful payment
+                order_id:    orderData.id,
+                handler:     function (response) {
+                    // Razorpay calls this after successful payment
                     saveParticipant(response);
                 },
                 prefill: {
-                    name: fullName,
-                    email: email,
+                    name:    fullName,
+                    email:   email,
                     contact: phone,
                 },
-                theme: {
-                    color: '#3D82F8',
-                },
+                theme: { color: '#3D82F8' },
             };
+
             const rzp = new window.Razorpay(options);
             rzp.open();
 
-        } catch (error) {
-            setError(error.message);
+        } catch (err) {
+            setError(err.message);
         } finally {
             setLoading(false);
         }
     };
 
-    // Helper function to check the current registration status
+    // ─────────────────────────────────────────────────────────────────────────
+    // UI helpers (unchanged)
+    // ─────────────────────────────────────────────────────────────────────────
     const getRegistrationStatus = () => {
-        // If no settings data, allow registration (open by default)
-        if (!settingsData) {
-            return { status: 'OPEN', message: '' };
-        }
-        
-        const now = new Date();
-        const startDate = settingsData.registration_start_datetime ? new Date(settingsData.registration_start_datetime) : null;
-        const endDate = settingsData.registration_end_datetime ? new Date(settingsData.registration_end_datetime) : null;
-        
-        if (startDate && now < startDate) {
+        if (!settingsData) return { status: 'OPEN', message: '' };
+
+        const now       = new Date();
+        const startDate = settingsData.registration_start_datetime
+            ? new Date(settingsData.registration_start_datetime) : null;
+        const endDate   = settingsData.registration_end_datetime
+            ? new Date(settingsData.registration_end_datetime) : null;
+
+        if (startDate && now < startDate)
             return { status: 'NOT_STARTED', message: `Registration opens on ${startDate.toLocaleDateString()}` };
-        }
-        if (endDate && now > endDate) {
+        if (endDate && now > endDate)
             return { status: 'CLOSED', message: 'Registration for this event has closed.' };
-        }
-        if (settingsData.max_participants != null && participantCount >= settingsData.max_participants) {
+        if (settingsData.max_participants != null && participantCount >= settingsData.max_participants)
             return { status: 'FULL', message: 'Sorry, this event is full.' };
-        }
-        
+
         return { status: 'OPEN', message: '' };
     };
 
-    // This function decides what to render in the main body
     const renderBody = () => {
         if (isFormSubmitted) {
             return (
                 <>
                     <h1>Registration Successful!</h1>
-                    <p>{settingsData?.confirmation_message || "Thank you for registering!"}</p>
+                    <p>{settingsData?.confirmation_message || 'Thank you for registering!'}</p>
                 </>
             );
         }
 
         const registration = getRegistrationStatus();
-
         if (registration.status !== 'OPEN') {
             return (
                 <div>
@@ -204,70 +238,71 @@ const saveParticipant = async (paymentDetails = {}) => {
                 </div>
             );
         }
-        
-        const fee = settingsData.registration_fee ? (settingsData.registration_fee / 100).toFixed(2) : 0;
+
+        const fee = settingsData?.registration_fee
+            ? (settingsData.registration_fee / 100).toFixed(2)
+            : 0;
 
         return (
             <form onSubmit={initiatePayment}>
                 <h3>Register Now {fee > 0 && `(Fee: ₹${fee})`}</h3>
-                
+
                 <div className="form-group">
                     <label>Full Name *</label>
-                    <input 
-                        type="text" 
-                        value={fullName} 
-                        onChange={(e) => setFullName(e.target.value)} 
+                    <input
+                        type="text"
+                        value={fullName}
+                        onChange={(e) => setFullName(e.target.value)}
                         placeholder="Enter your full name"
-                        required 
+                        required
                     />
                 </div>
                 <div className="form-group">
                     <label>Email *</label>
-                    <input 
-                        type="email" 
-                        value={email} 
-                        onChange={(e) => setEmail(e.target.value)} 
+                    <input
+                        type="email"
+                        value={email}
+                        onChange={(e) => setEmail(e.target.value)}
                         placeholder="Enter your email address"
-                        required 
+                        required
                     />
                 </div>
 
-                {/* Show phone field if settings require it OR if no settings (default behavior) */}
                 {(settingsData?.required_fields?.includes('Phone') || !settingsData) && (
                     <div className="form-group">
                         <label>Phone</label>
-                        <input 
-                            type="tel" 
-                            value={phone} 
-                            onChange={(e) => setPhone(e.target.value)} 
+                        <input
+                            type="tel"
+                            value={phone}
+                            onChange={(e) => setPhone(e.target.value)}
                             placeholder="Enter your phone number"
                         />
                     </div>
                 )}
-                {/* Show role field if settings require it OR if no settings (default behavior) */}
                 {(settingsData?.required_fields?.includes('Role') || !settingsData) && (
                     <div className="form-group">
                         <label>Your Role</label>
-                        <input 
-                            type="text" 
-                            value={role} 
-                            onChange={(e) => setRole(e.target.value)} 
+                        <input
+                            type="text"
+                            value={role}
+                            onChange={(e) => setRole(e.target.value)}
                             placeholder="e.g., Student, Professional, etc."
                         />
                     </div>
                 )}
 
                 <button type="submit" disabled={loading}>
-                    {loading ? 'Processing...' : (fee > 0 ? 'Pay & Register' : 'Register for Free')}
+                    {loading
+                        ? 'Processing...'
+                        : fee > 0 ? 'Pay & Register' : 'Register for Free'}
                 </button>
             </form>
         );
     };
 
-    // Top-level render logic for the whole component
-    if (loading) return <div className="container"><div className="loader"></div></div>;
-    if (error) return <div className="container"><p className="error-message">{error}</p></div>;
-    if (!eventData) return <div className="container"><p>Event not found.</p></div>;
+    if (loading)     return <div className="container"><div className="loader"></div></div>;
+    if (error)       return <div className="container"><p className="error-message">{error}</p></div>;
+    if (!eventData)  return <div className="container"><p>Event not found.</p></div>;
 
     return (
         <div className="container">
