@@ -169,7 +169,7 @@ function RegistrationForm() {
             const orderData = await orderResponse.json();
 
             const options = {
-                key:         process.env.REACT_APP_RAZORPAY_KEY_ID,
+                key:         'rzp_test_RKAMFR3BJ3GzR1',
                 amount:      orderData.amount,
                 currency:    orderData.currency,
                 name:        eventData.event_title,
